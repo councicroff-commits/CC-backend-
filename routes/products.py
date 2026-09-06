@@ -92,7 +92,6 @@ async def list_products(
         query["status"] = status
     
     try:
-        # Added skip and limit for pagination to prevent memory overflow
         products = await Product.find(query).sort("-_id").skip(skip).limit(limit).to_list()
         return [format_product_dto(p, is_list_view=True) for p in products]
         
@@ -113,7 +112,9 @@ async def get_single_product(product_id: str):
         raise HTTPException(status_code=400, detail="Invalid product ID format.")
 
 
-@router.post('/')
+# Note: Changed from '@router.post('/')' to '@router.post('')' to match the GET route 
+# and prevent trailing slash redirect issues causing HTTP 405 errors from the frontend.
+@router.post('')
 async def create_product(data: ProductCreate):
     if data.category.lower() not in ALLOWED_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"Category must be one of {ALLOWED_CATEGORIES}")
@@ -143,7 +144,6 @@ async def edit_product(product_id: str, data: ProductUpdate):
         if not product:
             raise HTTPException(status_code=404, detail="Product not found")
 
-        # Only update fields that were actually provided in the request
         update_data = data.model_dump(exclude_unset=True)
         if update_data:
             update_data['updated_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
