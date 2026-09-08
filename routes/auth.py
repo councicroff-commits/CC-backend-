@@ -1,6 +1,8 @@
 import os
 import hmac
 import logging
+import random
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Annotated, Any, List
 
@@ -9,6 +11,7 @@ from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr, Field
 from jose import JWTError, jwt
 from beanie import PydanticObjectId
+import resend
 
 from models import User, AdminUser, Order, hash_password, verify_password
 
@@ -19,6 +22,13 @@ logger = logging.getLogger("CommercePrime_Auth")
 SECRET_KEY = os.getenv("SECRET_KEY", "cc-eshop-super-secret-key-change-me-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+# Initialize Resend safely using environment variables only
+resend.api_key = os.getenv("RESEND_API_KEY")
+
+# Temporary in-memory OTP storage for pending registrations (Expires in 5 minutes)
+# Format: { email: { "otp": "123456", "expires_at": timestamp, "data": {...} } }
+otp_storage = {}
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -45,7 +55,7 @@ class AdminUpdateRequest(BaseModel):
 
 
 # =========================================================================
-# CUSTOMER USER SCHEMAS
+# CUSTOMER USER SCHEMAS & OTP SCHEMAS
 # =========================================================================
 class UserRegister(BaseModel):
     fullName: str = Field(..., min_length=2, max_length=100)
@@ -56,6 +66,17 @@ class UserRegister(BaseModel):
     birthDate: Optional[str] = None
     gender: Optional[str] = "Other"
     facebook: Optional[str] = None
+    age: Optional[Any] = None
+
+
+class SendOtpRequest(BaseModel):
+    email: EmailStr
+    registrationData: dict
+
+
+class VerifyAndRegisterRequest(BaseModel):
+    email: EmailStr
+    otpCode: str
 
 
 class UserLogin(BaseModel):
@@ -276,14 +297,139 @@ async def setup_initial_admin():
 
 
 # =========================================================================
-# CUSTOMER USER ROUTES
+# CUSTOMER USER & LIVE EMAIL VERIFICATION ROUTES
 # =========================================================================
+@router.post("/send-otp", status_code=status.HTTP_200_OK)
+async def send_otp(payload: SendOtpRequest):
+    try:
+        # Check if email is already registered in DB
+        existing_email = await User.find_one({"email": payload.registrationData.get("email")})
+        if existing_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+
+        existing_username = await User.find_one({"username": payload.registrationData.get("username")})
+        if existing_username:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already taken"
+            )
+
+        # Generate 6-digit OTP code
+        otp = str(random.randint(100000, 999999))
+
+        # Store in memory with 5-minute expiration
+        otp_storage[payload.email] = {
+            "otp": otp,
+            "expires_at": time.time() + 300,
+            "data": payload.registrationData
+        }
+
+        # Send email via Resend API
+        params = {
+            "from": "CC Ecom <onboarding@resend.dev>",
+            "to": [payload.email],
+            "subject": "CC Ecom Account Verification Code",
+            "html": f"""
+                <div style="font-family: Arial, sans-serif; padding: 20px; color: #111;">
+                    <h2>Welcome to CC Ecom!</h2>
+                    <p>Your verification code is:</p>
+                    <h1 style="color: #0284c7; letter-spacing: 4px;">{otp}</h1>
+                    <p>This code will expire in 5 minutes.</p>
+                </div>
+            """,
+        }
+        resend.Emails.send(params)
+        logger.info(f"OTP verification code sent successfully to {payload.email}")
+
+        return {"success": True, "message": "Verification code sent successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send verification email via Resend: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to dispatch verification email.")
+
+
+@router.post("/verify-and-register", status_code=status.HTTP_201_CREATED)
+async def verify_and_register(payload: VerifyAndRegisterRequest):
+    record = otp_storage.get(payload.email)
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending verification found or session expired. Please register again."
+        )
+
+    if time.time() > record["expires_at"]:
+        del otp_storage[payload.email]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification code has expired. Please request a new one."
+        )
+
+    if record["otp"] != payload.otpCode:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification code."
+        )
+
+    # OTP is valid, retrieve user data payload
+    user_data = record["data"]
+
+    try:
+        hashed_pw, salt = hash_password(user_data.get("password"))
+        if isinstance(salt, bytes):
+            salt = salt.hex()
+            
+        now = datetime.now(timezone.utc).isoformat()
+
+        new_user = User(
+            email=user_data.get("email"),
+            password=hashed_pw,
+            salt=salt,
+            username=user_data.get("username"),
+            fullName=user_data.get("fullName"),
+            mobile=user_data.get("mobile") or "",
+            birthDate=user_data.get("birthDate") or "",
+            gender=user_data.get("gender") or "Other",
+            facebook=user_data.get("facebook") or "",
+            avatar="",
+            age=str(user_data.get("age", "N/A")),
+            membershipTier="CC Prime",
+            status="Active",
+            isVerified=True,  # Verified via OTP
+            is_admin=False,
+            created_at=now,
+        )
+
+        await new_user.insert()
+        logger.info(f"New customer registered and verified successfully: {new_user.email}")
+
+        # Clean up temporary storage
+        del otp_storage[payload.email]
+
+        return {
+            "success": True,
+            "message": "Account successfully created and verified!",
+            "user": user_to_dict(new_user),
+            "userId": str(new_user.id),
+            "_id": str(new_user.id),
+        }
+
+    except Exception as e:
+        logger.error(f"Database error during final user creation after OTP verification: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during account creation.")
+
+
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserRegister):
+    # Legacy / direct register endpoint (kept as backup or direct insert)
     try:
         existing_email = await User.find_one({"email": user_data.email})
         if existing_email:
-            logger.info(f"Registration attempt failed: Email already registered ({user_data.email})")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered",
@@ -291,7 +437,6 @@ async def register(user_data: UserRegister):
 
         existing_username = await User.find_one({"username": user_data.username})
         if existing_username:
-            logger.info(f"Registration attempt failed: Username already taken ({user_data.username})")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Username already taken",
@@ -314,7 +459,7 @@ async def register(user_data: UserRegister):
             gender=user_data.gender or "Other",
             facebook=user_data.facebook or "",
             avatar="",
-            age="N/A",
+            age=str(user_data.age) if user_data.age else "N/A",
             membershipTier="CC Prime",
             status="Active",
             isVerified=False,
