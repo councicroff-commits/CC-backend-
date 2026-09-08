@@ -5,13 +5,14 @@ import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Annotated, Any, List
+import smtplib
+from email.message import EmailMessage
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr, Field
 from jose import JWTError, jwt
 from beanie import PydanticObjectId
-import resend
 
 from models import User, AdminUser, Order, hash_password, verify_password
 
@@ -22,9 +23,6 @@ logger = logging.getLogger("CommercePrime_Auth")
 SECRET_KEY = os.getenv("SECRET_KEY", "cc-eshop-super-secret-key-change-me-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
-
-# Initialize Resend safely using environment variables only
-resend.api_key = os.getenv("RESEND_API_KEY")
 
 # Temporary in-memory OTP storage for pending registrations (Expires in 5 minutes)
 # Format: { email: { "otp": "123456", "expires_at": timestamp, "data": {...} } }
@@ -297,7 +295,7 @@ async def setup_initial_admin():
 
 
 # =========================================================================
-# CUSTOMER USER & LIVE EMAIL VERIFICATION ROUTES
+# CUSTOMER USER & LIVE GMAIL SMTP VERIFICATION ROUTES
 # =========================================================================
 @router.post("/send-otp", status_code=status.HTTP_200_OK)
 async def send_otp(payload: SendOtpRequest):
@@ -327,30 +325,43 @@ async def send_otp(payload: SendOtpRequest):
             "data": payload.registrationData
         }
 
-        # Send email via Resend API
-        params = {
-            "from": "CC Ecom <onboarding@resend.dev>",
-            "to": [payload.email],
-            "subject": "CC Ecom Account Verification Code",
-            "html": f"""
-                <div style="font-family: Arial, sans-serif; padding: 20px; color: #111;">
-                    <h2>Welcome to CC Ecom!</h2>
-                    <p>Your verification code is:</p>
-                    <h1 style="color: #0284c7; letter-spacing: 4px;">{otp}</h1>
-                    <p>This code will expire in 5 minutes.</p>
-                </div>
-            """,
-        }
-        resend.Emails.send(params)
-        logger.info(f"OTP verification code sent successfully to {payload.email}")
+        # Setup email message
+        msg = EmailMessage()
+        msg["Subject"] = "CC Ecom Account Verification Code"
+        smtp_user = os.getenv("SMTP_USER", "councicroff@gmail.com")
+        msg["From"] = f"CC Ecom <{smtp_user}>"
+        msg["To"] = payload.email
+        
+        html_content = f"""
+            <div style="font-family: Arial, sans-serif; padding: 20px; color: #111;">
+                <h2>Welcome to CC Ecom!</h2>
+                <p>Your verification code is:</p>
+                <h1 style="color: #0284c7; letter-spacing: 4px;">{otp}</h1>
+                <p>This code will expire in 5 minutes.</p>
+            </div>
+        """
+        msg.set_content(f"Your verification code is: {otp}")
+        msg.add_alternative(html_content, subtype="html")
 
+        # Dispatch via Gmail SMTP
+        smtp_pass = os.getenv("SMTP_PASS")
+        if not smtp_pass:
+            logger.error("SMTP_PASS environment variable is missing!")
+            raise HTTPException(status_code=500, detail="Server configuration error: SMTP credentials not set.")
+
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+
+        logger.info(f"SMTP OTP verification code sent successfully to {payload.email}")
         return {"success": True, "message": "Verification code sent successfully"}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to send verification email via Resend: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to dispatch verification email.")
+        logger.error(f"Failed to send verification email via Gmail SMTP: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to dispatch verification email: {str(e)}")
 
 
 @router.post("/verify-and-register", status_code=status.HTTP_201_CREATED)
